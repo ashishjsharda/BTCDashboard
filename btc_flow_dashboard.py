@@ -6,6 +6,7 @@ import requests
 import plotly.express as px
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 import time
 
 st.set_page_config(page_title="BTC Flow Radar", page_icon="📊", layout="wide")
@@ -286,9 +287,57 @@ def backtest_predictions(df: pd.DataFrame, margin: float):
     return stats, df
 
 
+def get_next_quarter_hour_et():
+    """Return the next :00/:15/:30/:45 boundary in US Eastern time (handles EST/EDT automatically)."""
+    now_et = datetime.now(ZoneInfo("America/New_York"))
+    next_minute = ((now_et.minute // 15) + 1) * 15
+    if next_minute == 60:
+        next_time = (now_et + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+    else:
+        next_time = now_et.replace(minute=next_minute, second=0, microsecond=0)
+    return next_time
+
+
+def generate_forward_forecast(signal_df: pd.DataFrame, live_price: float, backtest_stats: dict):
+    """
+    Project the composite signal one bar forward from the current live price.
+    The range band is sized from the backtest's own RMSE/median error — not a
+    made-up confidence interval — so the widget can't imply more precision
+    than the signal has actually demonstrated on history.
+    """
+    last_row = signal_df.iloc[-1]
+    composite = last_row["composite_score"] if not pd.isna(last_row["composite_score"]) else 0.0
+    recent_vol = signal_df["close"].rolling(20).std().iloc[-1]
+    recent_vol = 0.0 if pd.isna(recent_vol) else recent_vol
+
+    predicted_delta = composite * recent_vol * 0.1
+    predicted_price = live_price + predicted_delta
+
+    # Range width: use backtested RMSE if available (reflects real historical error),
+    # otherwise fall back to recent volatility as a rough placeholder.
+    if backtest_stats and backtest_stats.get("rmse"):
+        range_width = backtest_stats["rmse"]
+    else:
+        range_width = recent_vol if recent_vol else 25.0
+
+    return {
+        "predicted_price": predicted_price,
+        "predicted_delta": predicted_delta,
+        "range_low": predicted_price - range_width,
+        "range_high": predicted_price + range_width,
+        "range_width": range_width,
+    }
+
+
 # ==================== MAIN DASHBOARD ====================
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["🔴 Live Monitor", "📈 Historical + Anomalies", "🎯 Signal Lab (15-min backtest)", "⚡ Alerts & Actions"]
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    [
+        "🔴 Live Monitor",
+        "📈 Historical + Anomalies",
+        "🎯 Signal Lab (15-min backtest)",
+        "🔮 Next Interval Forecast",
+        "⚡ Alerts & Actions",
+    ]
 )
 
 with tab1:
@@ -494,6 +543,79 @@ with tab3:
         st.error("Could not load price history. Check network access to Binance's public API.")
 
 with tab4:
+    st.subheader("🔮 Next 15-Minute Interval Forecast")
+    st.caption(
+        "Projects the composite signal forward to the next quarter-hour mark "
+        "(:00 / :15 / :30 / :45 ET). The range shown is sized from the Signal Lab "
+        "backtest's actual measured error — not a generic confidence interval."
+    )
+
+    st.warning(
+        "⚠️ Per the Signal Lab backtest, this composite signal showed ~coin-flip "
+        "directional accuracy and a wide typical error at this timeframe. Treat the "
+        "number below as a rough projection with real uncertainty, not a forecast "
+        "to trade on.",
+        icon="⚠️",
+    )
+
+    forecast_auto_refresh = st.checkbox("Auto-refresh forecast", value=True, key="forecast_autorefresh")
+    if forecast_auto_refresh:
+        st_autorefresh(interval=15000, key="forecast_autorefresh_timer")
+
+    live_for_forecast = fetch_live_price()
+
+    if "error" in live_for_forecast:
+        st.error(f"Couldn't fetch live price: {live_for_forecast['error']}")
+    else:
+        with st.spinner("Loading recent price history for the forecast model..."):
+            forecast_price_df = fetch_binance_klines(limit=max(lookback_bars, 100))
+
+        if forecast_price_df is not None and not forecast_price_df.empty:
+            forecast_signal_df = build_signals(forecast_price_df)
+            forecast_stats, _ = backtest_predictions(forecast_signal_df, margin=price_margin)
+
+            forecast = generate_forward_forecast(
+                forecast_signal_df, live_for_forecast["price"], forecast_stats
+            )
+
+            next_mark = get_next_quarter_hour_et()
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+
+            st.caption(
+                f"Current time: {now_et.strftime('%-I:%M:%S %p')} ET · "
+                f"Current price: ${live_for_forecast['price']:,.2f}"
+            )
+
+            fc1, fc2 = st.columns(2)
+            with fc1:
+                st.metric(
+                    f"Predicted price by {next_mark.strftime('%-I:%M %p')} ET",
+                    f"${forecast['predicted_price']:,.2f}",
+                    delta=f"{forecast['predicted_delta']:+.2f}",
+                )
+            with fc2:
+                st.metric(
+                    "Estimated range (± backtested RMSE)",
+                    f"${forecast['range_low']:,.2f} – ${forecast['range_high']:,.2f}",
+                )
+
+            if forecast_stats:
+                st.caption(
+                    f"Range width based on backtested RMSE of ${forecast_stats['rmse']:.2f} over "
+                    f"{forecast_stats['n_predictions']:,} historical 15-min predictions "
+                    f"(directional accuracy: {forecast_stats['directional_accuracy']*100:.1f}%)."
+                )
+            else:
+                st.caption("Not enough history yet to size the range from a backtest — using recent volatility instead.")
+
+            st.info(
+                "Next quarter-hour marks today: 7:00, 7:15, 7:30, 7:45, 8:00 ET, etc. "
+                "This widget always targets the *next* one from the current time."
+            )
+        else:
+            st.error("Could not load price history for the forecast.")
+
+with tab5:
     st.subheader("Alert Configuration & Actions")
 
     st.write("**How alerts work:**")
