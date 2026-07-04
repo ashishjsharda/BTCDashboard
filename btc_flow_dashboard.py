@@ -125,28 +125,58 @@ def send_telegram(msg: str, token: str, chat_id: str):
 @st.cache_data(ttl=60)
 def fetch_binance_klines(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500):
     """
-    Fetch OHLCV klines from Binance's public market data endpoint (no API key required).
-    Used for price history to backtest signals against. This is price data only —
-    not a trading connection, no keys, no order placement.
+    Fetch OHLCV candles from Coinbase Exchange's public market data endpoint
+    (no API key required). Used for price history to backtest signals against.
+    This is price data only — not a trading connection, no keys, no order placement.
+
+    Note: Binance's API returns HTTP 451 ("unavailable for legal reasons") for
+    requests originating from US IP addresses, which includes most cloud hosts
+    like Streamlit Cloud. Coinbase's public candles endpoint has no such
+    restriction, so it's used here instead. `symbol`/`interval` args are kept
+    for compatibility but mapped to Coinbase's product/granularity format.
     """
-    url = "https://api.binance.com/api/v3/klines"
-    params = {"symbol": symbol, "interval": interval, "limit": min(limit, 1000)}
+    product = "BTC-USD"
+    granularity_map = {"15m": 900, "1m": 60, "5m": 300, "1h": 3600, "1d": 86400}
+    granularity = granularity_map.get(interval, 900)
+    bar_seconds = granularity
+
+    url = f"https://api.exchange.coinbase.com/products/{product}/candles"
+    headers = {"User-Agent": "btc-flow-radar/1.0"}
+
+    all_rows = []
+    end_time = datetime.utcnow()
+    remaining = min(limit, 3000)  # sane cap to avoid excessive pagination
+
     try:
-        r = requests.get(url, params=params, timeout=15)
-        r.raise_for_status()
-        raw = r.json()
-        df = pd.DataFrame(
-            raw,
-            columns=[
-                "open_time", "open", "high", "low", "close", "volume",
-                "close_time", "quote_volume", "trades", "taker_buy_base",
-                "taker_buy_quote", "ignore",
-            ],
-        )
-        df["open_time"] = pd.to_datetime(df["open_time"], unit="ms")
-        for c in ["open", "high", "low", "close", "volume", "quote_volume"]:
+        while remaining > 0:
+            batch_size = min(remaining, 300)  # Coinbase max candles per request
+            start_time = end_time - timedelta(seconds=bar_seconds * batch_size)
+            params = {
+                "start": start_time.isoformat(),
+                "end": end_time.isoformat(),
+                "granularity": granularity,
+            }
+            r = requests.get(url, params=params, headers=headers, timeout=15)
+            r.raise_for_status()
+            batch = r.json()  # each row: [time, low, high, open, close, volume]
+            if not batch:
+                break
+            all_rows.extend(batch)
+            remaining -= batch_size
+            end_time = start_time
+            time.sleep(0.2)  # be polite to the public endpoint, avoid rate limiting
+
+        if not all_rows:
+            st.error("No price data returned from Coinbase.")
+            return None
+
+        df = pd.DataFrame(all_rows, columns=["time", "low", "high", "open", "close", "volume"])
+        df["open_time"] = pd.to_datetime(df["time"], unit="s")
+        for c in ["open", "high", "low", "close", "volume"]:
             df[c] = df[c].astype(float)
-        return df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]]
+        df = df.drop_duplicates(subset="open_time").sort_values("open_time").reset_index(drop=True)
+        df["quote_volume"] = df["volume"] * df["close"]  # approximation, Coinbase doesn't provide this directly
+        return df[["open_time", "open", "high", "low", "close", "volume", "quote_volume"]].tail(limit)
     except Exception as e:
         st.error(f"Failed to fetch price history: {e}")
         return None
