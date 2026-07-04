@@ -122,6 +122,30 @@ def send_telegram(msg: str, token: str, chat_id: str):
         return False
 
 
+@st.cache_data(ttl=10)
+def fetch_live_price():
+    """
+    Fetch the current BTC-USD price from Coinbase's public ticker endpoint.
+    No API key required. Cached for 10s so a busy page doesn't hammer the
+    endpoint on every rerun.
+    """
+    url = "https://api.exchange.coinbase.com/products/BTC-USD/ticker"
+    headers = {"User-Agent": "btc-flow-radar/1.0"}
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return {
+            "price": float(data["price"]),
+            "bid": float(data["bid"]),
+            "ask": float(data["ask"]),
+            "volume_24h": float(data["volume"]),
+            "time": data.get("time"),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 @st.cache_data(ttl=60)
 def fetch_binance_klines(symbol: str = "BTCUSDT", interval: str = "15m", limit: int = 500):
     """
@@ -268,7 +292,25 @@ tab1, tab2, tab3, tab4 = st.tabs(
 )
 
 with tab1:
-    st.subheader("Current Flow Status")
+    st.subheader("Live BTC Price")
+    st.caption("Free public data — no API token required.")
+
+    live = fetch_live_price()
+    if "error" in live:
+        st.error(f"Couldn't fetch live price: {live['error']}")
+    else:
+        lc1, lc2, lc3, lc4 = st.columns(4)
+        lc1.metric("BTC-USD", f"${live['price']:,.2f}")
+        lc2.metric("Bid", f"${live['bid']:,.2f}")
+        lc3.metric("Ask", f"${live['ask']:,.2f}")
+        lc4.metric("Spread", f"${live['ask'] - live['bid']:,.2f}")
+        st.caption(
+            f"24h volume: {live['volume_24h']:,.1f} BTC · "
+            f"Source: Coinbase public ticker · Updates every ~10s on rerun"
+        )
+
+    st.divider()
+    st.subheader("Exchange Flow Status (requires CryptoQuant token)")
 
     col1, col2, col3 = st.columns(3)
 
