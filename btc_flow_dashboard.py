@@ -1,4 +1,5 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 import pandas as pd
 import numpy as np
 import requests
@@ -122,7 +123,6 @@ def send_telegram(msg: str, token: str, chat_id: str):
         return False
 
 
-@st.cache_data(ttl=10)
 def fetch_live_price():
     """
     Fetch the current BTC-USD price from Coinbase's public ticker endpoint.
@@ -293,6 +293,19 @@ tab1, tab2, tab3, tab4 = st.tabs(
 
 with tab1:
     st.subheader("Live BTC Price")
+
+    ac1, ac2 = st.columns([1, 3])
+    with ac1:
+        auto_refresh = st.checkbox("Auto-refresh", value=True, key="live_price_autorefresh")
+    with ac2:
+        refresh_secs = st.slider(
+            "Refresh every (seconds)", min_value=5, max_value=60, value=10, step=5,
+            disabled=not auto_refresh, key="live_price_refresh_secs",
+        )
+
+    if auto_refresh:
+        st_autorefresh(interval=refresh_secs * 1000, key="live_price_autorefresh_timer")
+
     st.caption("Free public data — no API token required.")
 
     live = fetch_live_price()
