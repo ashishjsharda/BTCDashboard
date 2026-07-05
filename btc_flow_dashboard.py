@@ -344,6 +344,22 @@ LOG_COLUMNS = [
 def load_prediction_log():
     try:
         df = pd.read_csv(LOG_FILE, parse_dates=["logged_at", "target_mark"])
+        if df.empty:
+            return pd.DataFrame(columns=LOG_COLUMNS)
+        # CSV round-trips lose real dtypes (bools/NaNs become strings), so parse
+        # explicitly rather than trusting whatever pandas inferred on read.
+        df["resolved"] = df["resolved"].apply(
+            lambda x: str(x).strip().lower() in ("true", "1", "1.0")
+        )
+        for col in ["hit_within_margin", "direction_correct"]:
+            df[col] = df[col].apply(
+                lambda x: True if str(x).strip().lower() in ("true", "1", "1.0")
+                else (False if str(x).strip().lower() in ("false", "0", "0.0") else np.nan)
+            )
+        # Use object dtype for columns that mix bool/NaN so later assignments
+        # never hit a strict float<->bool dtype-cast error.
+        for col in ["resolved", "hit_within_margin", "direction_correct"]:
+            df[col] = df[col].astype(object)
         return df
     except FileNotFoundError:
         return pd.DataFrame(columns=LOG_COLUMNS)
@@ -393,11 +409,18 @@ def resolve_pending_predictions(log_df: pd.DataFrame, candle_df: pd.DataFrame, m
     if log_df.empty or candle_df is None or candle_df.empty:
         return log_df
 
+    log_df = log_df.copy()
+    # Force object dtype on columns we're about to write bool/float/NaN mixes
+    # into — some pandas versions raise a TypeError trying to silently cast
+    # a bool into a float64 (all-NaN) column, so we sidestep that entirely.
+    for col in ["actual_price", "abs_error", "hit_within_margin", "direction_correct", "resolved"]:
+        log_df[col] = log_df[col].astype(object)
+
     now_et_naive = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
     candle_times = candle_df["open_time"]
 
     for idx, row in log_df.iterrows():
-        if bool(row["resolved"]):
+        if row["resolved"] in (True, "True", "true", 1):
             continue
         target_mark = pd.Timestamp(row["target_mark"])
         if target_mark > pd.Timestamp(now_et_naive) - timedelta(minutes=2):
@@ -411,21 +434,21 @@ def resolve_pending_predictions(log_df: pd.DataFrame, candle_df: pd.DataFrame, m
         target_utc = target_mark_et.astimezone(ZoneInfo("UTC")).tz_localize(None)
         time_diffs = (candle_times - target_utc).abs()
         nearest_idx = time_diffs.idxmin()
-        actual_price = candle_df.loc[nearest_idx, "close"]
+        actual_price = float(candle_df.loc[nearest_idx, "close"])
 
-        predicted_price = row["predicted_price"]
-        price_at_log = row["price_at_log_time"]
+        predicted_price = float(row["predicted_price"])
+        price_at_log = float(row["price_at_log_time"])
         abs_error = abs(actual_price - predicted_price)
-        hit = abs_error <= margin
+        hit = bool(abs_error <= margin)
         actual_dir = np.sign(actual_price - price_at_log)
         pred_dir = np.sign(predicted_price - price_at_log)
         direction_correct = bool(actual_dir == pred_dir)
 
-        log_df.loc[idx, "actual_price"] = actual_price
-        log_df.loc[idx, "abs_error"] = abs_error
-        log_df.loc[idx, "hit_within_margin"] = hit
-        log_df.loc[idx, "direction_correct"] = direction_correct
-        log_df.loc[idx, "resolved"] = True
+        log_df.at[idx, "actual_price"] = actual_price
+        log_df.at[idx, "abs_error"] = abs_error
+        log_df.at[idx, "hit_within_margin"] = hit
+        log_df.at[idx, "direction_correct"] = direction_correct
+        log_df.at[idx, "resolved"] = True
 
     return log_df
 
