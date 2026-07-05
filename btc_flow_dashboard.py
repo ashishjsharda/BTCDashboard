@@ -329,6 +329,107 @@ def generate_forward_forecast(signal_df: pd.DataFrame, live_price: float, backte
     }
 
 
+# ==================== PREDICTION LOG (persisted to local CSV) ====================
+# Note: Streamlit Cloud's filesystem is ephemeral — this log resets on redeploy
+# or after extended inactivity. It's a running record for the current deployment,
+# not permanent storage. For permanent history, this would need a small database.
+LOG_FILE = "prediction_log.csv"
+LOG_COLUMNS = [
+    "logged_at", "target_mark", "price_at_log_time", "predicted_price",
+    "predicted_delta", "range_low", "range_high", "resolved",
+    "actual_price", "abs_error", "hit_within_margin", "direction_correct",
+]
+
+
+def load_prediction_log():
+    try:
+        df = pd.read_csv(LOG_FILE, parse_dates=["logged_at", "target_mark"])
+        return df
+    except FileNotFoundError:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+    except Exception:
+        return pd.DataFrame(columns=LOG_COLUMNS)
+
+
+def save_prediction_log(df: pd.DataFrame):
+    try:
+        df.to_csv(LOG_FILE, index=False)
+    except Exception as e:
+        st.caption(f"(Could not persist log to disk: {e})")
+
+
+def log_new_prediction_if_needed(log_df: pd.DataFrame, target_mark, price_now: float, forecast: dict):
+    """Log exactly one prediction per target 15-min mark — skip if already logged."""
+    target_mark_naive = pd.Timestamp(target_mark).tz_localize(None)
+    if not log_df.empty:
+        existing_marks = pd.to_datetime(log_df["target_mark"]).dt.tz_localize(None)
+        if (existing_marks == target_mark_naive).any():
+            return log_df  # already logged this interval, don't duplicate
+
+    new_row = {
+        "logged_at": datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None),
+        "target_mark": target_mark_naive,
+        "price_at_log_time": price_now,
+        "predicted_price": forecast["predicted_price"],
+        "predicted_delta": forecast["predicted_delta"],
+        "range_low": forecast["range_low"],
+        "range_high": forecast["range_high"],
+        "resolved": False,
+        "actual_price": np.nan,
+        "abs_error": np.nan,
+        "hit_within_margin": np.nan,
+        "direction_correct": np.nan,
+    }
+    log_df = pd.concat([log_df, pd.DataFrame([new_row])], ignore_index=True)
+    return log_df
+
+
+def resolve_pending_predictions(log_df: pd.DataFrame, candle_df: pd.DataFrame, margin: float):
+    """
+    For any logged prediction whose target_mark has passed, find the actual
+    price from candle history (closest candle open near the target time) and
+    score it: hit within margin, absolute error, and directional correctness.
+    """
+    if log_df.empty or candle_df is None or candle_df.empty:
+        return log_df
+
+    now_et_naive = datetime.now(ZoneInfo("America/New_York")).replace(tzinfo=None)
+    candle_times = candle_df["open_time"]
+
+    for idx, row in log_df.iterrows():
+        if bool(row["resolved"]):
+            continue
+        target_mark = pd.Timestamp(row["target_mark"])
+        if target_mark > pd.Timestamp(now_et_naive) - timedelta(minutes=2):
+            continue  # not enough time has passed yet to have a reliable candle
+
+        # candle_df timestamps are naive UTC (from Coinbase's epoch seconds).
+        # target_mark is naive ET — localize properly to America/New_York, then
+        # convert to UTC (this correctly handles the EST/EDT transition, unlike
+        # a fixed-hour offset would).
+        target_mark_et = target_mark.tz_localize(ZoneInfo("America/New_York"))
+        target_utc = target_mark_et.astimezone(ZoneInfo("UTC")).tz_localize(None)
+        time_diffs = (candle_times - target_utc).abs()
+        nearest_idx = time_diffs.idxmin()
+        actual_price = candle_df.loc[nearest_idx, "close"]
+
+        predicted_price = row["predicted_price"]
+        price_at_log = row["price_at_log_time"]
+        abs_error = abs(actual_price - predicted_price)
+        hit = abs_error <= margin
+        actual_dir = np.sign(actual_price - price_at_log)
+        pred_dir = np.sign(predicted_price - price_at_log)
+        direction_correct = bool(actual_dir == pred_dir)
+
+        log_df.loc[idx, "actual_price"] = actual_price
+        log_df.loc[idx, "abs_error"] = abs_error
+        log_df.loc[idx, "hit_within_margin"] = hit
+        log_df.loc[idx, "direction_correct"] = direction_correct
+        log_df.loc[idx, "resolved"] = True
+
+    return log_df
+
+
 # ==================== MAIN DASHBOARD ====================
 tab1, tab2, tab3, tab4, tab5 = st.tabs(
     [
@@ -551,10 +652,10 @@ with tab4:
     )
 
     st.warning(
-        "⚠️ Per the Signal Lab backtest, this composite signal showed ~coin-flip "
-        "directional accuracy and a wide typical error at this timeframe. Treat the "
-        "number below as a rough projection with real uncertainty, not a forecast "
-        "to trade on.",
+        "⚠️ Every prediction below gets logged and scored once its time mark passes, "
+        "so the 'Running Accuracy' section reflects real outcomes — not cherry-picked "
+        "good moments. Expect it to hover near coin-flip levels based on the Signal Lab "
+        "backtest; that's the honest baseline, not a failure of the tool.",
         icon="⚠️",
     )
 
@@ -581,6 +682,14 @@ with tab4:
             next_mark = get_next_quarter_hour_et()
             now_et = datetime.now(ZoneInfo("America/New_York"))
 
+            # ---- Load log, add this prediction if new, resolve any past-due ones ----
+            pred_log = load_prediction_log()
+            pred_log = log_new_prediction_if_needed(
+                pred_log, next_mark, live_for_forecast["price"], forecast
+            )
+            pred_log = resolve_pending_predictions(pred_log, forecast_price_df, price_margin)
+            save_prediction_log(pred_log)
+
             st.caption(
                 f"Current time: {now_et.strftime('%-I:%M:%S %p')} ET · "
                 f"Current price: ${live_for_forecast['price']:,.2f}"
@@ -605,13 +714,78 @@ with tab4:
                     f"{forecast_stats['n_predictions']:,} historical 15-min predictions "
                     f"(directional accuracy: {forecast_stats['directional_accuracy']*100:.1f}%)."
                 )
-            else:
-                st.caption("Not enough history yet to size the range from a backtest — using recent volatility instead.")
 
-            st.info(
-                "Next quarter-hour marks today: 7:00, 7:15, 7:30, 7:45, 8:00 ET, etc. "
-                "This widget always targets the *next* one from the current time."
-            )
+            st.divider()
+
+            # ---- Running accuracy from the live prediction log ----
+            st.subheader("📋 Running Accuracy (live predictions, not backtest)")
+
+            resolved = pred_log[pred_log["resolved"] == True].copy()  # noqa: E712
+
+            if resolved.empty:
+                st.info(
+                    "No predictions have resolved yet — check back after the next 15-min "
+                    "mark passes. Each one logged here is scored against what the price "
+                    "actually did, automatically."
+                )
+            else:
+                resolved["hit_within_margin"] = resolved["hit_within_margin"].astype(bool)
+                resolved["direction_correct"] = resolved["direction_correct"].astype(bool)
+
+                rc1, rc2, rc3, rc4 = st.columns(4)
+                rc1.metric("Predictions resolved", f"{len(resolved):,}")
+                rc2.metric(f"Hit rate (within ${price_margin})", f"{resolved['hit_within_margin'].mean()*100:.1f}%")
+                rc3.metric("Directional accuracy", f"{resolved['direction_correct'].mean()*100:.1f}%")
+                rc4.metric("Mean abs. error", f"${resolved['abs_error'].mean():.2f}")
+
+                st.caption(
+                    "This is the live, running version of the same scoring used in Signal Lab — "
+                    "it will converge toward similar numbers as more predictions accumulate."
+                )
+
+                display_log = resolved[
+                    ["target_mark", "price_at_log_time", "predicted_price", "actual_price",
+                     "abs_error", "hit_within_margin", "direction_correct"]
+                ].sort_values("target_mark", ascending=False).head(30).copy()
+                display_log["target_mark"] = pd.to_datetime(display_log["target_mark"]).dt.strftime("%-I:%M %p")
+                display_log = display_log.rename(columns={
+                    "target_mark": "Time (ET)",
+                    "price_at_log_time": "Price when predicted",
+                    "predicted_price": "Predicted",
+                    "actual_price": "Actual",
+                    "abs_error": "Abs. error ($)",
+                    "hit_within_margin": f"Hit (±${price_margin})",
+                    "direction_correct": "Direction correct",
+                })
+
+                def _highlight_hits(row):
+                    color = "background-color: #d4f4dd" if row[f"Hit (±${price_margin})"] else "background-color: #fbe1e1"
+                    return [color] * len(row)
+
+                st.dataframe(
+                    display_log.style.format(
+                        {"Price when predicted": "${:,.2f}", "Predicted": "${:,.2f}",
+                         "Actual": "${:,.2f}", "Abs. error ($)": "${:,.2f}"}
+                    ).apply(_highlight_hits, axis=1),
+                    use_container_width=True,
+                )
+
+                # Rolling mean accuracy chart so you can see the trend, not just a single number
+                resolved_sorted = resolved.sort_values("target_mark")
+                resolved_sorted["rolling_hit_rate"] = (
+                    resolved_sorted["hit_within_margin"].rolling(10, min_periods=1).mean()
+                )
+                fig5 = px.line(
+                    resolved_sorted, x="target_mark", y="rolling_hit_rate",
+                    title="Rolling Hit Rate (10-prediction window)",
+                )
+                fig5.update_yaxes(range=[0, 1], tickformat=".0%")
+                st.plotly_chart(fig5, use_container_width=True)
+
+                if st.button("Reset prediction log"):
+                    save_prediction_log(pd.DataFrame(columns=LOG_COLUMNS))
+                    st.success("Log cleared. Refresh to start fresh.")
+
         else:
             st.error("Could not load price history for the forecast.")
 
